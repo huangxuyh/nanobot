@@ -40,6 +40,7 @@ from nanobot.utils.document import extract_documents
 from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
+from nanobot.workflow import WorkflowRecord, WorkflowStore
 
 if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig, ToolsConfig, WebToolsConfig
@@ -136,6 +137,11 @@ class AgentLoop:
 
     _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
     _PENDING_USER_TURN_KEY = "pending_user_turn"
+    _ACTIVE_WORKFLOW_KEY = "active_workflow_id"
+    _ACTIVE_SUBAGENT_TASK_KEY = "active_subagent_task_id"
+    _ACTIVE_SUBAGENT_LABEL_KEY = "active_subagent_label"
+    _PROCESSED_SUBAGENT_TASKS_KEY = "processed_subagent_task_ids"
+    _RESUME_GENERATION_KEY = "resume_generation"
 
     def __init__(
         self,
@@ -196,6 +202,7 @@ class AgentLoop:
 
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
         self.sessions = session_manager or SessionManager(workspace)
+        self.workflows = WorkflowStore(workspace)
         self.tools = ToolRegistry()
         self.runner = AgentRunner(provider)
         self.subagents = SubagentManager(
@@ -288,7 +295,13 @@ class AgentLoop:
             )
             self.tools.register(WebFetchTool(proxy=self.web_config.proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
-        self.tools.register(SpawnTool(manager=self.subagents))
+        self.tools.register(
+            SpawnTool(
+                manager=self.subagents,
+                can_spawn=self._can_spawn_tool_subagent,
+                on_spawn=self._on_spawn_tool_subagent,
+            )
+        )
         if self.cron_service:
             self.tools.register(
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
@@ -343,6 +356,8 @@ class AgentLoop:
         """Return the session key used for task routing and mid-turn injections."""
         if self._unified_session and not msg.session_key_override:
             return UNIFIED_SESSION_KEY
+        if msg.channel == "system" and not msg.session_key_override:
+            return msg.chat_id if ":" in msg.chat_id else f"cli:{msg.chat_id}"
         return msg.session_key
 
     async def _run_agent_loop(
@@ -389,6 +404,14 @@ class AgentLoop:
             """Non-blocking drain of follow-up messages from the pending queue."""
             if pending_queue is None:
                 return []
+            if session is not None:
+                workflow = self._get_active_workflow(session)
+                if (
+                    workflow is not None
+                    and self._get_active_subagent_task_id(workflow)
+                    and workflow.state in {"running", "resuming"}
+                ):
+                    return []
             items: list[dict[str, Any]] = []
             while len(items) < limit:
                 try:
@@ -645,6 +668,15 @@ class AgentLoop:
                 self.sessions.save(session)
 
             session, pending = self.auto_compact.prepare_session(session, key)
+            if msg.sender_id == "subagent":
+                direct = await self._handle_structured_subagent_outcome(
+                    session,
+                    channel=channel,
+                    chat_id=chat_id,
+                    metadata=msg.metadata,
+                )
+                if direct is not None:
+                    return direct
 
             await self.consolidator.maybe_consolidate_by_tokens(session)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
@@ -657,10 +689,21 @@ class AgentLoop:
                 session_summary=pending,
                 current_role=current_role,
             )
-            final_content, _, all_msgs, _, _ = await self._run_agent_loop(
+            final_content, tools_used, all_msgs, _, _ = await self._run_agent_loop(
                 messages, session=session, channel=channel, chat_id=chat_id,
                 message_id=msg.metadata.get("message_id"),
             )
+            active_workflow = self._get_active_workflow(session)
+            if (
+                active_workflow is not None
+                and "spawn" in tools_used
+                and active_workflow.state == "running"
+                and self._get_active_subagent_task_id(active_workflow)
+            ):
+                final_content = (
+                    "Subagent started. Wait for the subagent to return its next status update "
+                    "before providing more input."
+                )
             self._save_turn(session, all_msgs, 1 + len(history))
             self._clear_runtime_checkpoint(session)
             self.sessions.save(session)
@@ -694,6 +737,19 @@ class AgentLoop:
         ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
         if result := await self.commands.dispatch(ctx):
             return result
+
+        workflow = self._get_active_workflow(session)
+        if workflow and workflow.state in {"awaiting_user_input", "awaiting_approval"}:
+            return await self._resume_blocked_workflow(session, msg, workflow)
+        if workflow and workflow.state == "resuming":
+            content = (
+                "The current workflow is resuming. "
+                "Wait for the active subagent to finish before sending more input."
+            )
+            session.add_message("user", msg.content)
+            session.add_message("assistant", content)
+            self.sessions.save(session)
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
 
         await self.consolidator.maybe_consolidate_by_tokens(session)
 
@@ -739,7 +795,7 @@ class AgentLoop:
             self.sessions.save(session)
             user_persisted_early = True
 
-        final_content, _, all_msgs, stop_reason, had_injections = await self._run_agent_loop(
+        final_content, tools_used, all_msgs, stop_reason, had_injections = await self._run_agent_loop(
             initial_messages,
             on_progress=on_progress or _bus_progress,
             on_stream=on_stream,
@@ -753,6 +809,18 @@ class AgentLoop:
 
         if final_content is None or not final_content.strip():
             final_content = EMPTY_FINAL_RESPONSE_MESSAGE
+
+        active_workflow = self._get_active_workflow(session)
+        if (
+            active_workflow is not None
+            and "spawn" in tools_used
+            and active_workflow.state == "running"
+            and self._get_active_subagent_task_id(active_workflow)
+        ):
+            final_content = (
+                "Subagent started. Wait for the subagent to return its next status update "
+                "before providing more input."
+            )
 
         # Skip the already-persisted user message when saving the turn
         save_skip = 1 + len(history) + (1 if user_persisted_early else 0)
@@ -884,6 +952,461 @@ class AgentLoop:
     def _clear_runtime_checkpoint(self, session: Session) -> None:
         if self._RUNTIME_CHECKPOINT_KEY in session.metadata:
             session.metadata.pop(self._RUNTIME_CHECKPOINT_KEY, None)
+
+    def _set_active_workflow(self, session: Session, workflow_id: str) -> None:
+        session.metadata[self._ACTIVE_WORKFLOW_KEY] = workflow_id
+
+    def _clear_active_workflow(
+        self,
+        session: Session,
+        *,
+        expected_workflow_id: str | None = None,
+    ) -> None:
+        current = session.metadata.get(self._ACTIVE_WORKFLOW_KEY)
+        if expected_workflow_id and current != expected_workflow_id:
+            return
+        session.metadata.pop(self._ACTIVE_WORKFLOW_KEY, None)
+
+    def _get_active_workflow(self, session: Session) -> WorkflowRecord | None:
+        workflow_id = session.metadata.get(self._ACTIVE_WORKFLOW_KEY)
+        if not workflow_id:
+            return None
+        workflow = self.workflows.load(str(workflow_id))
+        if workflow is None:
+            self._clear_active_workflow(session)
+        return workflow
+
+    def _ensure_workflow(
+        self,
+        session: Session,
+        *,
+        workflow_id: str | None = None,
+        stage: str | None = None,
+        workflow_type: str = "generic",
+    ) -> WorkflowRecord:
+        workflow: WorkflowRecord | None = None
+        if workflow_id:
+            workflow = self.workflows.load(workflow_id)
+            if workflow is None:
+                workflow = self.workflows.create(
+                    session.key,
+                    workflow_type=workflow_type,
+                    workflow_id=workflow_id,
+                    current_stage=stage,
+                )
+        else:
+            workflow = self._get_active_workflow(session)
+        if workflow is None:
+            workflow = self.workflows.create(
+                session.key,
+                workflow_type=workflow_type,
+                current_stage=stage,
+            )
+        if stage:
+            workflow.current_stage = stage
+        self._set_active_workflow(session, workflow.workflow_id)
+        return workflow
+
+    def _get_active_subagent_task_id(self, workflow: WorkflowRecord) -> str | None:
+        task_id = workflow.metadata.get(self._ACTIVE_SUBAGENT_TASK_KEY)
+        return str(task_id) if task_id else None
+
+    def _set_active_subagent(
+        self,
+        workflow: WorkflowRecord,
+        *,
+        task_id: str,
+        label: str | None = None,
+    ) -> None:
+        workflow.metadata[self._ACTIVE_SUBAGENT_TASK_KEY] = task_id
+        if label:
+            workflow.metadata[self._ACTIVE_SUBAGENT_LABEL_KEY] = label
+
+    def _clear_active_subagent(self, workflow: WorkflowRecord) -> None:
+        workflow.metadata.pop(self._ACTIVE_SUBAGENT_TASK_KEY, None)
+        workflow.metadata.pop(self._ACTIVE_SUBAGENT_LABEL_KEY, None)
+
+    def _processed_subagent_task_ids(self, workflow: WorkflowRecord) -> set[str]:
+        values = workflow.metadata.get(self._PROCESSED_SUBAGENT_TASKS_KEY) or []
+        if not isinstance(values, list):
+            return set()
+        return {str(v) for v in values if v}
+
+    def _mark_subagent_task_processed(self, workflow: WorkflowRecord, task_id: str | None) -> None:
+        if not task_id:
+            return
+        processed = self._processed_subagent_task_ids(workflow)
+        processed.add(task_id)
+        workflow.metadata[self._PROCESSED_SUBAGENT_TASKS_KEY] = sorted(processed)
+
+    async def _resume_from_pending_followup_if_available(
+        self,
+        session: Session,
+        workflow: WorkflowRecord,
+        *,
+        channel: str,
+        chat_id: str,
+    ) -> OutboundMessage | None:
+        pending_queue = self._pending_queues.get(session.key)
+        if pending_queue is None:
+            return None
+
+        drained: list[InboundMessage] = []
+        candidate: InboundMessage | None = None
+        while True:
+            try:
+                item = pending_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if (
+                candidate is None
+                and isinstance(item, InboundMessage)
+                and item.channel != "system"
+                and bool(item.content.strip())
+                and not self.commands.is_priority(item.content.strip())
+            ):
+                candidate = item
+                continue
+            drained.append(item)
+
+        for item in drained:
+            pending_queue.put_nowait(item)
+
+        if candidate is None:
+            return None
+
+        if candidate.channel != channel or candidate.chat_id != chat_id:
+            candidate = dataclasses.replace(candidate, channel=channel, chat_id=chat_id)
+        return await self._resume_blocked_workflow(session, candidate, workflow)
+
+    def _next_resume_generation(self, workflow: WorkflowRecord) -> int:
+        current = workflow.metadata.get(self._RESUME_GENERATION_KEY)
+        generation = int(current) + 1 if isinstance(current, int) else 1
+        workflow.metadata[self._RESUME_GENERATION_KEY] = generation
+        return generation
+
+    async def _on_spawn_tool_subagent(
+        self,
+        *,
+        task_id: str,
+        label: str | None,
+        session_key: str,
+        workflow_id: str | None,
+        stage: str | None,
+    ) -> None:
+        if not workflow_id:
+            return
+        session = self.sessions.get_or_create(session_key)
+        workflow = self._ensure_workflow(
+            session,
+            workflow_id=workflow_id,
+            stage=stage,
+        )
+        workflow.state = "running"
+        self._set_active_subagent(workflow, task_id=task_id, label=label)
+        self.workflows.save(workflow)
+        self.sessions.save(session)
+
+    async def _can_spawn_tool_subagent(
+        self,
+        *,
+        label: str | None,
+        session_key: str,
+        workflow_id: str | None,
+        stage: str | None,
+    ) -> str | None:
+        if not workflow_id:
+            return None
+        session = self.sessions.get_or_create(session_key)
+        workflow = self.workflows.load(workflow_id)
+        if workflow is None:
+            return None
+        active_task_id = self._get_active_subagent_task_id(workflow)
+        if active_task_id and not self.subagents.is_task_running(active_task_id):
+            self._clear_active_subagent(workflow)
+            workflow.metadata.pop("last_subagent", None)
+            if workflow.state in {"running", "resuming"}:
+                workflow.state = "running"
+            self.workflows.save(workflow)
+            self.sessions.save(session)
+            active_task_id = None
+        if active_task_id and workflow.state in {"running", "resuming", "awaiting_user_input", "awaiting_approval"}:
+            return (
+                f"Skipped duplicate subagent spawn for workflow {workflow_id}"
+                f" stage {stage or workflow.current_stage or 'unknown'} because an active subagent is already running."
+            )
+        just_completed_stage = workflow.metadata.get("just_completed_stage")
+        if stage and just_completed_stage == stage:
+            return (
+                f"Skipped duplicate subagent spawn for workflow {workflow_id}"
+                f" stage {stage} because this stage was already completed in the current workflow."
+            )
+        self.sessions.save(session)
+        return None
+
+    @staticmethod
+    def _format_human_request(outcome: dict[str, Any]) -> str:
+        question = str(
+            outcome.get("question") or "This workflow needs more information before it can continue."
+        ).strip()
+        fields = outcome.get("fields")
+        if isinstance(fields, list) and fields:
+            lines = [question, "", "Please provide the following information:"]
+            for field in fields:
+                if not isinstance(field, dict):
+                    continue
+                label = str(field.get("label") or field.get("name") or "Unnamed field")
+                required = " (required)" if field.get("required") else ""
+                lines.append(f"- {label}{required}")
+            return "\n".join(lines)
+        if outcome.get("status") == "needs_approval":
+            return f'{question}\n\nReply "confirm" to continue, or "cancel" to stop.'
+        return question
+
+    @staticmethod
+    def _parse_approval_decision(text: str) -> str | None:
+        normalized = text.strip().lower()
+        if normalized in {
+            "\u786e\u8ba4",
+            "\u7ee7\u7eed",
+            "\u540c\u610f",
+            "\u6279\u51c6",
+            "confirm",
+            "continue",
+            "yes",
+            "y",
+            "approve",
+            "approved",
+            "ok",
+        }:
+            return "approve"
+        if normalized in {
+            "\u53d6\u6d88",
+            "\u62d2\u7edd",
+            "\u4e0d\u540c\u610f",
+            "cancel",
+            "no",
+            "n",
+            "reject",
+            "denied",
+            "stop",
+        }:
+            return "reject"
+        return None
+
+    def _build_resume_task(
+        self,
+        workflow: WorkflowRecord,
+        user_response: dict[str, Any],
+    ) -> str:
+        resume_payload = workflow.resume_payload or {}
+        task_template = str(
+            resume_payload.get("task_template")
+            or f"Resume workflow stage {workflow.current_stage or 'unknown'}."
+        ).strip()
+        sections = [
+            task_template,
+            "",
+            f"Workflow ID: {workflow.workflow_id}",
+        ]
+        if workflow.current_stage:
+            sections.append(f"Stage: {workflow.current_stage}")
+        context = resume_payload.get("context")
+        if isinstance(context, dict) and context:
+            sections.extend([
+                "",
+                "Saved context:",
+                json.dumps(context, ensure_ascii=False, indent=2),
+            ])
+        sections.extend([
+            "",
+            "User response:",
+            json.dumps(user_response, ensure_ascii=False, indent=2),
+            "",
+            "Continue from the current stage instead of restarting the whole workflow.",
+        ])
+        return "\n".join(sections)
+
+    async def _handle_structured_subagent_outcome(
+        self,
+        session: Session,
+        *,
+        channel: str,
+        chat_id: str,
+        metadata: dict[str, Any],
+    ) -> OutboundMessage | None:
+        outcome = metadata.get("subagent_outcome")
+        if not isinstance(outcome, dict):
+            return None
+
+        status = str(outcome.get("status") or "")
+        stage = outcome.get("stage")
+        workflow_id = outcome.get("workflow_id")
+        task_id = str(metadata.get("subagent_task_id") or "") or None
+
+        if status in {"needs_user_input", "needs_approval"}:
+            workflow = self._ensure_workflow(
+                session,
+                workflow_id=str(workflow_id) if workflow_id else None,
+                stage=str(stage) if stage else None,
+                workflow_type=str(outcome.get("workflow_type") or "generic"),
+            )
+            active_task_id = self._get_active_subagent_task_id(workflow)
+            processed_task_ids = self._processed_subagent_task_ids(workflow)
+            if task_id in processed_task_ids:
+                return OutboundMessage(channel=channel, chat_id=chat_id, content="")
+            if active_task_id and task_id and active_task_id != task_id:
+                return OutboundMessage(channel=channel, chat_id=chat_id, content="")
+            workflow.state = (
+                "awaiting_user_input" if status == "needs_user_input" else "awaiting_approval"
+            )
+            workflow.awaiting = {
+                "kind": "user_input" if status == "needs_user_input" else "approval",
+                "question": outcome.get("question"),
+                "fields": outcome.get("fields") if isinstance(outcome.get("fields"), list) else [],
+                "approval_type": outcome.get("approval_type"),
+                "blocking": True,
+            }
+            workflow.resume_payload = (
+                dict(outcome.get("resume_payload") or {})
+                if isinstance(outcome.get("resume_payload"), dict)
+                else {}
+            )
+            workflow.metadata["last_subagent"] = {
+                "task_id": metadata.get("subagent_task_id"),
+                "label": metadata.get("subagent_label"),
+            }
+            if task_id:
+                self._set_active_subagent(
+                    workflow,
+                    task_id=task_id,
+                    label=str(metadata.get("subagent_label") or ""),
+                )
+                self._mark_subagent_task_processed(workflow, task_id)
+            self.workflows.save(workflow)
+            self.sessions.save(session)
+
+            resumed = await self._resume_from_pending_followup_if_available(
+                session,
+                workflow,
+                channel=channel,
+                chat_id=chat_id,
+            )
+            if resumed is not None:
+                return resumed
+
+            content = self._format_human_request(outcome)
+            session.add_message("assistant", content)
+            self.sessions.save(session)
+            return OutboundMessage(channel=channel, chat_id=chat_id, content=content)
+
+        if status in {"ok", "error"}:
+            workflow = None
+            if workflow_id or session.metadata.get(self._ACTIVE_WORKFLOW_KEY):
+                workflow = self._ensure_workflow(
+                    session,
+                    workflow_id=str(workflow_id) if workflow_id else None,
+                    stage=str(stage) if stage else None,
+                    workflow_type=str(outcome.get("workflow_type") or "generic"),
+                )
+            if workflow is not None:
+                active_task_id = self._get_active_subagent_task_id(workflow)
+                processed_task_ids = self._processed_subagent_task_ids(workflow)
+                if task_id in processed_task_ids:
+                    return OutboundMessage(channel=channel, chat_id=chat_id, content="")
+                if active_task_id and task_id and active_task_id != task_id:
+                    return OutboundMessage(channel=channel, chat_id=chat_id, content="")
+                workflow.awaiting = None
+                if status == "error":
+                    workflow.state = "failed"
+                    self._clear_active_subagent(workflow)
+                    self._clear_active_workflow(
+                        session,
+                        expected_workflow_id=workflow.workflow_id,
+                    )
+                else:
+                    workflow.state = "running"
+                    self._clear_active_subagent(workflow)
+                    if workflow.current_stage:
+                        workflow.metadata["just_completed_stage"] = workflow.current_stage
+                self._mark_subagent_task_processed(workflow, task_id)
+                self.workflows.save(workflow)
+                self.sessions.save(session)
+        return None
+
+    async def _resume_blocked_workflow(
+        self,
+        session: Session,
+        msg: InboundMessage,
+        workflow: WorkflowRecord,
+    ) -> OutboundMessage:
+        user_text = msg.content.strip()
+        awaiting = workflow.awaiting or {}
+        response_payload: dict[str, Any]
+
+        if workflow.state == "awaiting_approval":
+            decision = self._parse_approval_decision(user_text)
+            if decision is None:
+                content = 'This workflow is waiting for approval. Reply "confirm" to continue, or "cancel" to stop.'
+                session.add_message("user", msg.content)
+                session.add_message("assistant", content)
+                self.sessions.save(session)
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
+            if decision == "reject":
+                workflow.state = "cancelled"
+                workflow.awaiting = None
+                self.workflows.save(workflow)
+                self._clear_active_workflow(session, expected_workflow_id=workflow.workflow_id)
+                session.add_message("user", msg.content)
+                content = "Cancelled the workflow that was waiting for approval."
+                session.add_message("assistant", content)
+                self.sessions.save(session)
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
+            response_payload = {"approval": "approved", "raw_text": user_text}
+        else:
+            response_payload = {"raw_text": user_text}
+            fields = awaiting.get("fields")
+            if isinstance(fields, list) and fields:
+                response_payload["fields"] = fields
+            if msg.media:
+                response_payload["media"] = list(msg.media)
+
+        workflow.metadata["last_user_response"] = response_payload
+        workflow.state = "resuming"
+        workflow.awaiting = None
+        workflow.metadata.pop("just_completed_stage", None)
+        previous_task_id = self._get_active_subagent_task_id(workflow)
+        if previous_task_id:
+            await self.subagents.cancel_task(previous_task_id)
+            self._mark_subagent_task_processed(workflow, previous_task_id)
+        generation = self._next_resume_generation(workflow)
+        self.workflows.save(workflow)
+
+        task = self._build_resume_task(workflow, response_payload)
+        label = str(
+            (workflow.resume_payload or {}).get("subagent_label")
+            or workflow.current_stage
+            or "workflow-resume"
+        )
+        task_id, _ = await self.subagents.spawn_task(
+            task=task,
+            label=label,
+            origin_channel=msg.channel,
+            origin_chat_id=msg.chat_id,
+            session_key=session.key,
+            workflow_id=workflow.workflow_id,
+            stage=workflow.current_stage,
+        )
+        self._set_active_subagent(workflow, task_id=task_id, label=label)
+        workflow.metadata["resume_generation_active"] = generation
+        self.workflows.save(workflow)
+
+        stage_suffix = f" ({workflow.current_stage})" if workflow.current_stage else ""
+        content = f"Received your input. Continuing the current workflow{stage_suffix}."
+        session.add_message("user", msg.content)
+        session.add_message("assistant", content)
+        self.sessions.save(session)
+        return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
 
     @staticmethod
     def _checkpoint_message_key(message: dict[str, Any]) -> tuple[Any, ...]:
