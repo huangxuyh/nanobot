@@ -65,6 +65,21 @@ class DreamConfig(Base):
         return f"every {hours}h"
 
 
+class CAEGuardrailConfig(Base):
+    """CAE domain request guardrail configuration."""
+
+    enable: bool = False
+    mode: Literal["rule_only", "rule_plus_llm", "llm_only"] = "rule_plus_llm"
+    deny_template: str = (
+        "抱歉，我只能处理 CAE 相关的问答、脚本生成和流程执行请求。"
+        "当前请求不在允许范围内，因此不能继续处理。"
+    )
+    classifier_model: str | None = None
+    classifier_max_tokens: int = Field(default=120, ge=32, le=512)
+    allow_system_messages: bool = True
+    allow_commands: bool = True
+
+
 class AgentDefaults(Base):
     """Default agent configuration."""
 
@@ -91,6 +106,7 @@ class AgentDefaults(Base):
         serialization_alias="idleCompactAfterMinutes",
     )  # Auto-compact idle threshold in minutes (0 = disabled)
     dream: DreamConfig = Field(default_factory=DreamConfig)
+    cae_guardrail: CAEGuardrailConfig = Field(default_factory=CAEGuardrailConfig)
 
 
 class AgentsConfig(Base):

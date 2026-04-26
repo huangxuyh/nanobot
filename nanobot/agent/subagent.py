@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -95,6 +96,7 @@ class SubagentManager:
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._task_statuses: dict[str, SubagentStatus] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
+        self._task_contexts: dict[str, dict[str, Any]] = {}
 
     async def spawn(
         self,
@@ -103,8 +105,32 @@ class SubagentManager:
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
         session_key: str | None = None,
+        workflow_id: str | None = None,
+        stage: str | None = None,
     ) -> str:
         """Spawn a subagent to execute a task in the background."""
+        _, message = await self.spawn_task(
+            task=task,
+            label=label,
+            origin_channel=origin_channel,
+            origin_chat_id=origin_chat_id,
+            session_key=session_key,
+            workflow_id=workflow_id,
+            stage=stage,
+        )
+        return message
+
+    async def spawn_task(
+        self,
+        task: str,
+        label: str | None = None,
+        origin_channel: str = "cli",
+        origin_chat_id: str = "direct",
+        session_key: str | None = None,
+        workflow_id: str | None = None,
+        stage: str | None = None,
+    ) -> tuple[str, str]:
+        """Spawn a subagent and return both task id and user-facing message."""
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id, "session_key": session_key}
@@ -116,6 +142,11 @@ class SubagentManager:
             started_at=time.monotonic(),
         )
         self._task_statuses[task_id] = status
+        self._task_contexts[task_id] = {
+            "workflow_id": workflow_id,
+            "stage": stage,
+            "session_key": session_key,
+        }
 
         bg_task = asyncio.create_task(
             self._run_subagent(task_id, task, display_label, origin, status)
@@ -127,6 +158,7 @@ class SubagentManager:
         def _cleanup(_: asyncio.Task) -> None:
             self._running_tasks.pop(task_id, None)
             self._task_statuses.pop(task_id, None)
+            self._task_contexts.pop(task_id, None)
             if session_key and (ids := self._session_tasks.get(session_key)):
                 ids.discard(task_id)
                 if not ids:
@@ -135,7 +167,10 @@ class SubagentManager:
         bg_task.add_done_callback(_cleanup)
 
         logger.info("Spawned subagent [{}]: {}", task_id, display_label)
-        return f"Subagent [{display_label}] started (id: {task_id}). I'll notify you when it completes."
+        return (
+            task_id,
+            f"Subagent [{display_label}] started (id: {task_id}). I'll notify you when it completes.",
+        )
 
     async def _run_subagent(
         self,
@@ -211,8 +246,23 @@ class SubagentManager:
                 )
             else:
                 final_result = result.final_content or "Task completed but no final response was generated."
+                structured = self._extract_structured_outcome(final_result)
+                if structured is not None:
+                    ctx = self._task_contexts.get(task_id, {})
+                    if ctx.get("workflow_id") and not structured.get("workflow_id"):
+                        structured["workflow_id"] = ctx["workflow_id"]
+                    if ctx.get("stage") and not structured.get("stage"):
+                        structured["stage"] = ctx["stage"]
                 logger.info("Subagent [{}] completed successfully", task_id)
-                await self._announce_result(task_id, label, task, final_result, origin, "ok")
+                await self._announce_result(
+                    task_id,
+                    label,
+                    task,
+                    final_result,
+                    origin,
+                    "ok",
+                    structured_outcome=structured,
+                )
 
         except Exception as e:
             status.phase = "error"
@@ -228,6 +278,8 @@ class SubagentManager:
         result: str,
         origin: dict[str, str],
         status: str,
+        *,
+        structured_outcome: dict[str, Any] | None = None,
     ) -> None:
         """Announce the subagent result to the main agent via the message bus."""
         status_text = "completed successfully" if status == "ok" else "failed"
@@ -255,6 +307,9 @@ class SubagentManager:
             metadata={
                 "injected_event": "subagent_result",
                 "subagent_task_id": task_id,
+                "subagent_label": label,
+                "subagent_status": status,
+                **({"subagent_outcome": structured_outcome} if structured_outcome else {}),
             },
         )
 
@@ -299,6 +354,27 @@ class SubagentManager:
             skills_summary=skills_summary or "",
         )
 
+    @staticmethod
+    def _extract_structured_outcome(text: str) -> dict[str, Any] | None:
+        """Extract a structured HITL outcome from final subagent text."""
+        candidate = text.strip()
+        fenced = re.search(r"```json\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+        if fenced:
+            candidate = fenced.group(1).strip()
+        elif not candidate.startswith("{"):
+            return None
+
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        status = data.get("status")
+        if status not in {"ok", "needs_user_input", "needs_approval", "error"}:
+            return None
+        return data
+
     async def cancel_by_session(self, session_key: str) -> int:
         """Cancel all subagents for the given session. Returns count cancelled."""
         tasks = [self._running_tasks[tid] for tid in self._session_tasks.get(session_key, [])
@@ -308,6 +384,15 @@ class SubagentManager:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         return len(tasks)
+
+    async def cancel_task(self, task_id: str) -> bool:
+        """Cancel a specific running subagent task."""
+        task = self._running_tasks.get(task_id)
+        if task is None or task.done():
+            return False
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return True
 
     def get_running_count(self) -> int:
         """Return the number of currently running subagents."""
@@ -320,3 +405,8 @@ class SubagentManager:
             1 for tid in tids
             if tid in self._running_tasks and not self._running_tasks[tid].done()
         )
+
+    def is_task_running(self, task_id: str) -> bool:
+        """Return whether a specific subagent task is still actively running."""
+        task = self._running_tasks.get(task_id)
+        return task is not None and not task.done()

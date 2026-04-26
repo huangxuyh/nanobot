@@ -258,3 +258,63 @@ async def test_drain_pending_timeout(tmp_path):
         await hang_task
     except asyncio.CancelledError:
         pass
+
+
+def test_subagent_extracts_structured_hitl_outcome():
+    """Structured JSON should be extracted from fenced final text."""
+    from nanobot.agent.subagent import SubagentManager
+
+    outcome = SubagentManager._extract_structured_outcome(
+        """
+```json
+{
+  "status": "needs_user_input",
+  "question": "请补充网格尺寸",
+  "resume_payload": {
+    "task_template": "继续执行 mesh"
+  }
+}
+```
+"""
+    )
+
+    assert outcome is not None
+    assert outcome["status"] == "needs_user_input"
+    assert outcome["question"] == "请补充网格尺寸"
+
+
+@pytest.mark.asyncio
+async def test_spawn_tool_forwards_workflow_context():
+    """Spawn tool should forward workflow_id and stage to the manager."""
+    from nanobot.agent.tools.spawn import SpawnTool
+
+    manager = MagicMock()
+    manager.spawn_task = AsyncMock(return_value=("sub-1", "started"))
+    on_spawn = AsyncMock()
+    tool = SpawnTool(manager=manager, on_spawn=on_spawn)
+    tool.set_context("feishu", "chat123")
+
+    result = await tool.execute(
+        task="run mesh stage",
+        label="mesh",
+        workflow_id="wf_test_1",
+        stage="mesh",
+    )
+
+    assert result == "started"
+    manager.spawn_task.assert_awaited_once_with(
+        task="run mesh stage",
+        label="mesh",
+        origin_channel="feishu",
+        origin_chat_id="chat123",
+        session_key="feishu:chat123",
+        workflow_id="wf_test_1",
+        stage="mesh",
+    )
+    on_spawn.assert_awaited_once_with(
+        task_id="sub-1",
+        label="mesh",
+        session_key="feishu:chat123",
+        workflow_id="wf_test_1",
+        stage="mesh",
+    )

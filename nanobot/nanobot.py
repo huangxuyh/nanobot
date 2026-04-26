@@ -85,6 +85,7 @@ class Nanobot:
             disabled_skills=defaults.disabled_skills,
             session_ttl_minutes=defaults.session_ttl_minutes,
             tools_config=config.tools,
+            cae_guardrail_config=defaults.cae_guardrail,
         )
         return cls(loop)
 
